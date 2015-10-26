@@ -219,6 +219,7 @@ func (mc *mysqlConn) writeAuthPacket(cipher []byte) error {
 		clientTransactions |
 		clientLocalFiles |
 		clientPluginAuth |
+		clientMultiResults |
 		mc.flags&clientLongFlag
 
 	if mc.cfg.clientFoundRows {
@@ -644,6 +645,11 @@ func (rows *textRows) readRow(dest []driver.Value) error {
 
 	// EOF Packet
 	if data[0] == iEOF && len(data) == 5 {
+		// server_status [2 bytes]
+		rows.mc.status = readStatus(data[3:])
+		if err := rows.mc.discardMoreResultsIfExists(); err != nil {
+			return err
+		}
 		rows.mc = nil
 		return io.EOF
 	}
@@ -701,8 +707,33 @@ func (mc *mysqlConn) readUntilEOF() error {
 		if err == nil && data[0] != iEOF {
 			continue
 		}
+		if err == nil && data[0] == iEOF && len(data) == 5 {
+			mc.status = readStatus(data[3:])
+		}
 		return err // Err or EOF
 	}
+}
+
+func (mc *mysqlConn) discardMoreResultsIfExists() error {
+	for mc.status&statusMoreResultsExists != 0 {
+		resLen, err := mc.readResultSetHeaderPacket()
+		if err != nil {
+			return err
+		}
+		if resLen > 0 {
+			// columns
+			if err := mc.readUntilEOF(); err != nil {
+				return err
+			}
+			// rows
+			if err := mc.readUntilEOF(); err != nil {
+				return err
+			}
+		} else {
+			mc.status &^= statusMoreResultsExists
+		}
+	}
+	return nil
 }
 
 /******************************************************************************
@@ -1014,11 +1045,17 @@ func (rows *binaryRows) readRow(dest []driver.Value) error {
 
 	// packet indicator [1 byte]
 	if data[0] != iOK {
-		rows.mc = nil
+		// rows.mc = nil
 		// EOF Packet
 		if data[0] == iEOF && len(data) == 5 {
+			rows.mc.status = readStatus(data[3:])
+			if err := rows.mc.discardMoreResultsIfExists(); err != nil {
+				return err
+			}
+			rows.mc = nil
 			return io.EOF
 		}
+		rows.mc = nil
 
 		// Error otherwise
 		return rows.mc.handleErrorPacket(data)
@@ -1176,4 +1213,8 @@ func (rows *binaryRows) readRow(dest []driver.Value) error {
 	}
 
 	return nil
+}
+
+func readStatus(b []byte) statusFlag {
+	return statusFlag(b[0]) | statusFlag(b[1])<<8
 }
